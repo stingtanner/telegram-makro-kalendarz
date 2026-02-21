@@ -1,329 +1,220 @@
-"""telegram-makro-kalendarz (v8)
-
-PROFESJONALNA, stabilna wersja bez scrapowania stron.
-
-Dlaczego tak:
-- Serwisy instytucji (BLS, RBNZ, itd.) często blokują GitHub Actions (403).
-- Żeby mieć kalendarz jak w TradingView (impact / lista publikacji), potrzebne jest źródło, które *udostępnia dane w formie API*.
-
-Źródło danych (free tier): Finnhub Economic Calendar API.
-- Endpoint: /api/v1/calendar/economic
-- Zwraca m.in. currency, event, impact, date/time, actual/forecast/previous.
-
-Wymagania:
-- ustaw sekrety GitHub Actions:
-  - TG_BOT_TOKEN
-  - TG_CHAT_ID
-  - FINNHUB_TOKEN
-
-Tryb pracy:
-- raz dziennie około północy (Warszawa) publikuje wydarzenia HIGH
-  - dziś → niedziela
-  - w sobotę: poniedziałek → niedziela kolejnego tygodnia
-
-Uwaga:
-- "Złoto/Srebro/NASDAQ" (XAU/XAG/NAS100) to nie waluty z kalendarza makro.
-  Dodajemy je jako tagi w poście (tak jak prosiłeś), żeby łatwo filtrować kanał.
-"""
-
-from __future__ import annotations
-
 import os
-import sys
-import time
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
-
+import math
 import requests
+from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
+from dateutil import parser as dtparser
 
-# -------------------- Konfiguracja --------------------
+WARSAW = ZoneInfo("Europe/Warsaw")
 
-MAJOR_CCY = ["AUD", "CAD", "CHF", "EUR", "GBP", "JPY", "NZD", "USD"]
-EXTRA_TAGS = ["#XAU", "#XAG", "#NAS100"]
+CURRENCIES = {"USD","EUR","GBP","JPY","CHF","CAD","AUD","NZD"}
+EXTRA_TAGS = "#XAU #XAG #NAS100"
 
-WARSAW_TZ_NAME = "Europe/Warsaw"
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN","").strip()
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID","").strip()
+FMP_API_KEY = os.environ.get("FMP_API_KEY","").strip()
 
-# Telegram limit to 4096 chars; keep margin.
-TG_LIMIT = 3900
+TELEGRAM_LIMIT = 3900  # bezpieczny limit (Telegram ma ~4096)
 
-# Finnhub: best-effort retries (free tier)
-HTTP_TIMEOUT = 30
-HTTP_TRIES = 3
-
-FLAG = {
-    "USD": "🇺🇸",
-    "EUR": "🇪🇺",
-    "GBP": "🇬🇧",
-    "JPY": "🇯🇵",
-    "CHF": "🇨🇭",
-    "CAD": "🇨🇦",
-    "AUD": "🇦🇺",
-    "NZD": "🇳🇿",
+FLAGS = {
+    "USD":"🇺🇸","EUR":"🇪🇺","GBP":"🇬🇧","JPY":"🇯🇵","CHF":"🇨🇭","CAD":"🇨🇦","AUD":"🇦🇺","NZD":"🇳🇿"
 }
 
-
-@dataclass
-class CalEvent:
-    d: date
-    time_str: str  # as provided by API (often HH:MM)
-    ccy: str
-    impact: str
-    event: str
-    country: str
-    actual: Optional[str]
-    forecast: Optional[str]
-    previous: Optional[str]
-
-
-# -------------------- Time window --------------------
-
-
 def warsaw_today() -> date:
-    # Avoid extra dependencies; use system tz via environment where possible.
-    # GitHub runners are UTC; we shift by Warsaw offset approximately using pytz is not allowed.
-    # Instead, we rely on "cron" set near Warsaw midnight; and compute based on UTC date + 1h/2h.
-    # For correctness, we allow overriding via env for testing.
-    override = os.getenv("FORCE_TODAY")
-    if override:
-        return date.fromisoformat(override)
+    return datetime.now(WARSAW).date()
 
-    # Compute Warsaw date by using zoneinfo if available (Python 3.11 has it).
-    try:
-        from zoneinfo import ZoneInfo
-
-        return datetime.now(ZoneInfo(WARSAW_TZ_NAME)).date()
-    except Exception:
-        # Fallback: approximate with UTC now + 1 hour (good enough for around midnight runs)
-        return (datetime.utcnow() + timedelta(hours=1)).date()
-
-
-def week_window(today: date) -> Tuple[date, date]:
-    # weekday: Mon=0..Sun=6
-    wd = today.weekday()
-    if wd == 5:  # Saturday → next week
-        start = today + timedelta(days=2)  # Monday
-        end = start + timedelta(days=6)  # Sunday
+def week_window(today: date):
+    wd = today.weekday()  # Mon=0..Sun=6
+    if wd == 5:  # Saturday -> next week
+        start = today + timedelta(days=2)
+        end = start + timedelta(days=6)
     else:
         start = today
         end = today + timedelta(days=(6 - wd))
     return start, end
 
+def http_get_json(url: str, params: dict):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; TelegramMacroCalendar/1.0; +https://github.com/)",
+        "Accept": "application/json",
+    }
+    r = requests.get(url, params=params, headers=headers, timeout=30)
+    # Nie wypisujemy URL z tokenami w błędach
+    if r.status_code >= 400:
+        raise requests.HTTPError(f"HTTP {r.status_code} from data provider", response=r)
+    return r.json()
 
-# -------------------- Finnhub API --------------------
+def normalize_impact(ev: dict) -> str:
+    # FMP może używać różnych nazw pól w zależności od wersji.
+    for k in ("impact","Impact","importance","Importance","volatility","Volatility"):
+        if k in ev and ev[k] is not None:
+            v = str(ev[k]).strip().lower()
+            if v in {"high","3","high impact","high-impact"}: return "high"
+            if v in {"medium","2"}: return "medium"
+            if v in {"low","1"}: return "low"
+    # Czasem brak – wtedy nie uznajemy za HIGH
+    return "unknown"
 
-
-def http_get_json(url: str, params: Dict[str, str]) -> Any:
-    last_exc: Optional[Exception] = None
-    for i in range(HTTP_TRIES):
+def parse_datetime(ev: dict) -> datetime | None:
+    # próbujemy różnych pól
+    candidates = []
+    for k in ("date","Date","datetime","Datetime","publishedDate","PublishedDate"):
+        if k in ev and ev[k]:
+            candidates.append(str(ev[k]))
+    # czasem osobno: date + time
+    d = ev.get("date") or ev.get("Date")
+    t = ev.get("time") or ev.get("Time")
+    if d and t:
+        candidates.insert(0, f"{d} {t}")
+    for s in candidates:
         try:
-            r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
-            # Finnhub may rate limit (429). Backoff then retry.
-            if r.status_code == 429:
-                time.sleep(2.0 * (i + 1))
-                continue
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last_exc = e
-            time.sleep(1.5 * (i + 1))
-    raise last_exc  # type: ignore
-
-
-def fetch_finnhub_calendar(start: date, end: date) -> List[CalEvent]:
-    token = os.environ.get("FINNHUB_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError(
-            "Brak FINNHUB_TOKEN. Dodaj go w GitHub: Settings → Secrets and variables → Actions."
-        )
-
-    url = "https://finnhub.io/api/v1/calendar/economic"
-    data = http_get_json(
-        url,
-        {
-            "from": start.isoformat(),
-            "to": end.isoformat(),
-            "token": token,
-        },
-    )
-
-    items = data.get("economicCalendar") or data.get("economicCalendar", [])
-    if not isinstance(items, list):
-        return []
-
-    out: List[CalEvent] = []
-    for it in items:
-        try:
-            ccy = (it.get("currency") or "").upper().strip()
-            if ccy not in MAJOR_CCY:
-                continue
-
-            impact = (it.get("impact") or "").strip()
-            # Finnhub usually returns "High"/"Medium"/"Low"
-            if impact.lower() != "high":
-                continue
-
-            d_str = (it.get("date") or "").strip()
-            if not d_str:
-                continue
-            d = date.fromisoformat(d_str)
-
-            time_str = (it.get("time") or "").strip() or "--:--"
-            event = (it.get("event") or "").strip() or "(brak nazwy)"
-            country = (it.get("country") or "").strip()
-
-            def _val(k: str) -> Optional[str]:
-                v = it.get(k)
-                if v is None:
-                    return None
-                s = str(v).strip()
-                return s if s and s.lower() != "nan" else None
-
-            out.append(
-                CalEvent(
-                    d=d,
-                    time_str=time_str,
-                    ccy=ccy,
-                    impact=impact,
-                    event=event,
-                    country=country,
-                    actual=_val("actual"),
-                    forecast=_val("forecast"),
-                    previous=_val("previous"),
-                )
-            )
+            dt = dtparser.parse(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=WARSAW)
+            else:
+                dt = dt.astimezone(WARSAW)
+            return dt
         except Exception:
             continue
+    return None
 
-    # sort by date then time string
-    out.sort(key=lambda e: (e.d, e.time_str, e.ccy, e.event))
-    return out
+def extract_currency(ev: dict) -> str:
+    for k in ("currency","Currency"):
+        if k in ev and ev[k]:
+            return str(ev[k]).upper().strip()
+    # czasem "country" -> mapowanie? zostawiamy puste
+    return ""
 
+def extract_event_name(ev: dict) -> str:
+    for k in ("event","Event","title","Title","name","Name","indicator","Indicator"):
+        if k in ev and ev[k]:
+            return str(ev[k]).strip()
+    return "Wydarzenie"
 
-# -------------------- Telegram --------------------
+def fetch_fmp_calendar(start: date, end: date) -> list[dict]:
+    # dokumentacja: https://financialmodelingprep.com/stable/economic-calendar
+    url = "https://financialmodelingprep.com/stable/economic-calendar"
+    params = {
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "apikey": FMP_API_KEY,
+    }
+    data = http_get_json(url, params=params)
+    if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+        return data["data"]
+    if isinstance(data, list):
+        return data
+    return []
 
-
-def tg_send(text: str) -> None:
-    token = os.environ["TG_BOT_TOKEN"].strip()
-    chat_id = os.environ["TG_CHAT_ID"].strip()
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+def tg_send(text: str):
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": chat_id,
+        "chat_id": TG_CHAT_ID,
         "text": text,
         "disable_web_page_preview": True,
     }
     r = requests.post(url, data=payload, timeout=30)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        raise requests.HTTPError(f"Telegram HTTP {r.status_code}", response=r)
 
-
-def split_messages(text: str, limit: int = TG_LIMIT) -> List[str]:
-    parts: List[str] = []
-    cur = ""
-
-    def flush():
-        nonlocal cur
-        if cur:
-            parts.append(cur)
-            cur = ""
-
-    # split by blank lines blocks
-    for block in text.split("\n\n"):
-        block = block.strip()
-        if not block:
-            continue
-        candidate = (cur + ("\n\n" if cur else "") + block)
-        if len(candidate) <= limit:
-            cur = candidate
-        else:
-            flush()
-            if len(block) <= limit:
-                cur = block
-            else:
-                # hard split long block
-                for i in range(0, len(block), limit):
-                    parts.append(block[i : i + limit])
-    flush()
+def split_message(full: str) -> list[str]:
+    if len(full) <= TELEGRAM_LIMIT:
+        return [full]
+    parts = []
+    buf = ""
+    for line in full.splitlines(True):
+        if len(buf) + len(line) > TELEGRAM_LIMIT:
+            parts.append(buf.rstrip())
+            buf = ""
+        buf += line
+    if buf.strip():
+        parts.append(buf.rstrip())
+    # numeracja części
+    if len(parts) > 1:
+        total = len(parts)
+        parts = [f"{p}\n\n({i+1}/{total})" for i,p in enumerate(parts)]
     return parts
 
-
-# -------------------- Formatowanie --------------------
-
-
-def format_post(start: date, end: date, events: List[CalEvent]) -> str:
+def build_message(start: date, end: date, events: list[dict]) -> str:
     header = (
         f"📅 Kalendarz makro (HIGH) — {start.isoformat()} → {end.isoformat()} (Warszawa)\n"
-        f"Waluty: {', '.join(MAJOR_CCY)}\n"
-        f"Dodatkowo: {' '.join(EXTRA_TAGS)}\n"
-        "Źródło: Finnhub Economic Calendar (free tier)."
+        f"Waluty: {', '.join(sorted(CURRENCIES))}\n"
+        f"Dodatkowo: {EXTRA_TAGS}\n"
+        f"Źródło: FMP Economic Calendar (API)\n\n"
     )
 
     if not events:
-        return (
-            header
-            + "\n\nBrak wydarzeń HIGH w tym tygodniu dla wybranych walut.\n"
-            + "\n#forex #kalendarz #highimpact "
-            + " ".join(EXTRA_TAGS)
-        )
+        return header + "Brak danych HIGH do pokazania w tym zakresie.\n\n#forex #kalendarz #highimpact " + EXTRA_TAGS.replace(" ", " ")
 
-    # group by date
-    out: List[str] = [header]
+    # sortuj po czasie
+    rows = []
+    for ev in events:
+        cur = extract_currency(ev)
+        if cur not in CURRENCIES:
+            continue
+        if normalize_impact(ev) != "high":
+            continue
+        dt = parse_datetime(ev)
+        if not dt:
+            continue
+        if not (start <= dt.date() <= end):
+            continue
+        name = extract_event_name(ev)
+        actual = ev.get("actual") or ev.get("Actual")
+        forecast = ev.get("forecast") or ev.get("Forecast")
+        previous = ev.get("previous") or ev.get("Previous")
+        rows.append((dt, cur, name, actual, forecast, previous))
 
-    cur_day: Optional[date] = None
-    for e in events:
-        if cur_day != e.d:
-            cur_day = e.d
-            out.append(f"\n🗓 {cur_day.isoformat()}")
+    rows.sort(key=lambda x: x[0])
 
-        flag = FLAG.get(e.ccy, "🏳️")
-        line = f"• ⏰ {e.time_str}  {flag} {e.ccy} — {e.event}"
-        if e.country:
-            line += f" ({e.country})"
+    if not rows:
+        return header + "Brak danych HIGH do pokazania w tym zakresie.\n\n#forex #kalendarz #highimpact " + EXTRA_TAGS.replace(" ", " ")
 
-        extras: List[str] = []
-        if e.actual is not None:
-            extras.append(f"Actual: {e.actual}")
-        if e.forecast is not None:
-            extras.append(f"Forecast: {e.forecast}")
-        if e.previous is not None:
-            extras.append(f"Previous: {e.previous}")
+    out = [header]
+    current_day = None
+    for dt, cur, name, actual, forecast, previous in rows:
+        if dt.date() != current_day:
+            current_day = dt.date()
+            out.append(f"🗓 {current_day.isoformat()} ({current_day.strftime('%a')})")
+        flag = FLAGS.get(cur, "🏳️")
+        line = f"• ⏰ {dt.strftime('%H:%M')}  {flag} {cur} — {name}"
+        extras = []
+        if actual not in (None,"","N/A"): extras.append(f"Actual: {actual}")
+        if forecast not in (None,"","N/A"): extras.append(f"Forecast: {forecast}")
+        if previous not in (None,"","N/A"): extras.append(f"Previous: {previous}")
         if extras:
             line += "\n  " + " | ".join(extras)
-
         out.append(line)
+        out.append("")  # pusta linia
 
-    out.append("\n#forex #kalendarz #highimpact " + " ".join(EXTRA_TAGS))
+    out.append(f"#forex #kalendarz #highimpact {EXTRA_TAGS.replace(' ', ' ')}")
     return "\n".join(out).strip()
 
+def main():
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        raise SystemExit("Brak TG_BOT_TOKEN lub TG_CHAT_ID w sekretach GitHub.")
+    if not FMP_API_KEY:
+        raise SystemExit("Brak FMP_API_KEY w sekretach GitHub.")
 
-# -------------------- Main --------------------
-
-
-def main() -> int:
     today = warsaw_today()
     start, end = week_window(today)
 
     try:
-        events = fetch_finnhub_calendar(start, end)
+        data = fetch_fmp_calendar(start, end)
+        msg = build_message(start, end, data)
     except Exception as e:
-        # If API fails, still publish a short diagnostic (so you know it's alive)
+        # bez ujawniania tokenów
         msg = (
             f"📅 Kalendarz makro (HIGH) — {start.isoformat()} → {end.isoformat()} (Warszawa)\n"
-            f"Waluty: {', '.join(MAJOR_CCY)}\n"
-            f"Dodatkowo: {' '.join(EXTRA_TAGS)}\n\n"
-            "❌ Błąd pobierania danych z Finnhub.\n"
-            f"Szczegóły: {type(e).__name__}: {e}\n\n"
-            "#forex #kalendarz #highimpact "
-            + " ".join(EXTRA_TAGS)
+            f"Waluty: {', '.join(sorted(CURRENCIES))}\n"
+            f"Dodatkowo: {EXTRA_TAGS}\n\n"
+            f"❌ Błąd pobierania danych z FMP.\n"
+            f"Szczegóły: {type(e).__name__}: {str(e)}\n\n"
+            f"#forex #kalendarz #highimpact {EXTRA_TAGS.replace(' ', ' ')}"
         )
-        for part in split_messages(msg):
-            tg_send(part)
-        return 0
 
-    post = format_post(start, end, events)
-    for part in split_messages(post):
+    for part in split_message(msg):
         tg_send(part)
-    return 0
-
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
