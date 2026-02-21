@@ -22,6 +22,7 @@ from typing import Optional, Iterable, List, Dict, Tuple
 import requests
 from bs4 import BeautifulSoup
 from dateutil import tz
+from dateutil import parser as dateparser
 
 # -------------------- Config --------------------
 
@@ -124,8 +125,24 @@ def looks_high(title: str) -> bool:
     return False
 
 def parse_dates_from_text(text: str) -> List[date]:
-    # Very rough; we mainly rely on nearby text parsing by BeautifulSoup in specific functions.
-    return []
+    """Try to extract a concrete calendar date from arbitrary text.
+
+    We keep this intentionally conservative:
+    - If we can't parse a date, return [] (caller will skip the item).
+    - If we can parse, return [date].
+    """
+    try:
+        # Use a stable default so parser doesn't "invent" today's date from partial strings
+        default_dt = datetime(2000, 1, 1, 0, 0, tzinfo=WARSAW_TZ)
+        dt = dateparser.parse(text, fuzzy=True, dayfirst=True, default=default_dt)
+        if not dt:
+            return []
+        # If the parser returned the default date (meaning it likely failed), discard.
+        if dt.year == 2000 and dt.month == 1 and dt.day == 1:
+            return []
+        return [dt.astimezone(WARSAW_TZ).date() if dt.tzinfo else dt.date()]
+    except Exception:
+        return []
 
 def extract_events_generic(ccy: str, source_name: str, url: str, start: date, end: date) -> List[Event]:
     html = http_get(url)
@@ -137,15 +154,33 @@ def extract_events_generic(ccy: str, source_name: str, url: str, start: date, en
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     events: List[Event] = []
 
-    # simple heuristic: if line contains a month name + year or day number and contains a high keyword
+    # simple heuristic:
+    # - keep only lines that look HIGH
+    # - try to parse a *concrete* date from the line
+    # - keep only events that fall within [start, end]
     month_names = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"]
+    seen: set[tuple[str, str]] = set()
     for ln in lines:
         low = ln.lower()
         if not looks_high(ln):
             continue
-        if any(m in low for m in month_names) and any(ch.isdigit() for ch in low):
-            # We won't reliably parse dates for every site; post as undated item.
-            events.append(Event(dt=None, ccy=ccy, title=ln[:180], source=source_name))
+        if not (any(m in low for m in month_names) and any(ch.isdigit() for ch in low)):
+            continue
+
+        dates = parse_dates_from_text(ln)
+        if not dates:
+            continue
+
+        for d in dates:
+            if d < start or d > end:
+                continue
+            dt = datetime(d.year, d.month, d.day, 0, 0, tzinfo=WARSAW_TZ)
+            key = (ccy, ln[:180])
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append(Event(dt=dt, ccy=ccy, title=ln[:180], source=source_name))
+
     return events
 
 def collect_events(start: date, end: date) -> List[Event]:
