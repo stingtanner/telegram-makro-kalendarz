@@ -1,4 +1,4 @@
-# DEVLOG (v3)
+# DEVLOG (v5)
 
 ## v3 – ZMiana źródeł na darmowe (2026-02-21)
 ZROBIONE:
@@ -19,3 +19,9 @@ ZROBIONE:
 DO ZROBIENIA (opcjonalnie):
 - Dodać więcej „HIGH” publikacji dla EUR/GBP (np. inflacja/GDP) z dodatkowych oficjalnych źródeł (gdy będziesz chciał).
 - Lepsza obsługa zmian godzin publikacji (np. w sytuacji przesunięć przez święta).
+
+
+## v5 – Naprawa 403 z BLS (2026-02-21)
+ZROBIONE:
+- Dodano "browser-like" nagłówki (User-Agent/Accept/Referer) i retry w http_get.
+- Jeśli BLS nadal zwraca 403 w GitHub Actions, bot pomija źródło BLS zamiast wywalać cały workflow.

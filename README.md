@@ -1,4 +1,4 @@
-# Telegram – Kalendarz makro (HIGH) dla Forex (v3)
+# Telegram – Kalendarz makro (HIGH) dla Forex (v5)
 
 Cel: publiczny kanał Telegram, który **raz dziennie** publikuje listę **najważniejszych (HIGH)** wydarzeń makro **od dziś do końca bieżącego tygodnia**.
 W sobotę (wg ustawień) automatycznie przełącza zakres na **następny tydzień**.
@@ -83,3 +83,7 @@ Program automatycznie dzieli wiadomość na kilka postów (limit ustawisz w `tel
 - **Brak posta na kanale**: bot nie jest adminem albo nie ma uprawnienia „Post messages”.
 - **Błąd TG_CHAT_ID**: dla publicznego kanału wpisz dokładnie `@nazwa`.
 - **GitHub Actions nie działa**: repo → Actions → włącz workflow.
+
+
+## Zmiany v5
+- Naprawa źródła BLS: zamiast scrapowania HTML (czasem 403 w GitHub Actions) używany jest oficjalny feed iCalendar (.ics): https://www.bls.gov/schedule/news_release/bls.ics

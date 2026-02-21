@@ -143,12 +143,55 @@ def ics_dt_to_local(dt_raw: str, tzid: str | None, tz_local) -> Optional[datetim
 
 
 def http_get(url: str, timeout: int = 30) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; TelegramCalendarBot/1.0; +https://github.com/)"
+    """HTTP GET with browser-like headers and a couple of retries.
+
+    Some official sites (including BLS) may return 403 to default/robot-like requests
+    from CI runners. We try with realistic headers and retry once.
+    """
+    # Browser-like headers (helps with 403 on some public sites)
+    base_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/calendar;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,pl;q=0.8",
+        "Connection": "keep-alive",
+        "Referer": "https://www.google.com/",
     }
-    r = requests.get(url, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    return r.text
+
+    session = requests.Session()
+    last_exc = None
+
+    # Try a couple of variants
+    variants = [
+        base_headers,
+        {**base_headers, "Referer": "https://www.bls.gov/"},
+        {**base_headers, "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        )},
+    ]
+
+    for attempt, headers in enumerate(variants, start=1):
+        try:
+            r = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            if r.status_code == 403:
+                # Try next variant
+                last_exc = requests.exceptions.HTTPError(f"403 Forbidden for {url}", response=r)
+                continue
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last_exc = e
+            continue
+
+    # If still blocked, raise the last exception
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Failed to fetch {url}")
 
 def normalize_space(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
@@ -189,7 +232,11 @@ def fetch_bls_selected_releases(tz_local, start: datetime, end: datetime) -> Lis
     We use the ICS feed instead of scraping HTML (HTML may return 403 in CI environments).
     """
     url = "https://www.bls.gov/schedule/news_release/bls.ics"
-    ics_text = http_get(url)
+    try:
+        ics_text = http_get(url)
+    except Exception as e:
+        print(f"[WARN] BLS ICS fetch failed: {e}. Skipping BLS source.")
+        return []
     vevents = parse_ics_events(ics_text)
 
     events: List[Event] = []
