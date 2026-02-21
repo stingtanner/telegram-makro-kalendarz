@@ -3,13 +3,12 @@ name: Telegram Macro Calendar
 on:
   workflow_dispatch:
   schedule:
-    # GitHub cron jest w UTC. 23:05 UTC to okolice północy w Polsce (zależnie od zmiany czasu).
+    # 23:05 UTC ≈ okolice północy w PL (zależnie od zmiany czasu)
     - cron: "5 23 * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -28,6 +27,6 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          FINNHUB_TOKEN: ${{ secrets.FINNHUB_TOKEN }}
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
         run: |
           python -m src.main
