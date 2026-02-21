@@ -1,11 +1,29 @@
-"""
-Telegram public channel macro calendar (HIGH) - free sources, best-effort.
+"""telegram-makro-kalendarz (v8)
 
-Key design:
-- Runs daily (GitHub Actions) and posts events for: today->end of week; on Saturday posts next week.
-- Only "high impact" by curated keyword rules (because free official sources rarely provide impact ratings).
-- Uses best-effort HTTP fetching with browser-like headers.
-- IMPORTANT: any blocked source (403/timeout/etc.) is skipped, never crashes the run.
+PROFESJONALNA, stabilna wersja bez scrapowania stron.
+
+Dlaczego tak:
+- Serwisy instytucji (BLS, RBNZ, itd.) często blokują GitHub Actions (403).
+- Żeby mieć kalendarz jak w TradingView (impact / lista publikacji), potrzebne jest źródło, które *udostępnia dane w formie API*.
+
+Źródło danych (free tier): Finnhub Economic Calendar API.
+- Endpoint: /api/v1/calendar/economic
+- Zwraca m.in. currency, event, impact, date/time, actual/forecast/previous.
+
+Wymagania:
+- ustaw sekrety GitHub Actions:
+  - TG_BOT_TOKEN
+  - TG_CHAT_ID
+  - FINNHUB_TOKEN
+
+Tryb pracy:
+- raz dziennie około północy (Warszawa) publikuje wydarzenia HIGH
+  - dziś → niedziela
+  - w sobotę: poniedziałek → niedziela kolejnego tygodnia
+
+Uwaga:
+- "Złoto/Srebro/NASDAQ" (XAU/XAG/NAS100) to nie waluty z kalendarza makro.
+  Dodajemy je jako tagi w poście (tak jak prosiłeś), żeby łatwo filtrować kanał.
 """
 
 from __future__ import annotations
@@ -13,194 +31,181 @@ from __future__ import annotations
 import os
 import sys
 import time
-import json
-import textwrap
 from dataclasses import dataclass
-from datetime import datetime, date, timedelta, timezone
-from typing import Optional, Iterable, List, Dict, Tuple
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from bs4 import BeautifulSoup
-from dateutil import tz
-from dateutil import parser as dateparser
 
-# -------------------- Config --------------------
+# -------------------- Konfiguracja --------------------
 
-WARSAW_TZ = tz.gettz("Europe/Warsaw")
-
-MAJOR_CCY = {"USD","EUR","GBP","JPY","CHF","CAD","AUD","NZD"}
-
-# We'll tag the channel with these extra instruments (user request)
+MAJOR_CCY = ["AUD", "CAD", "CHF", "EUR", "GBP", "JPY", "NZD", "USD"]
 EXTRA_TAGS = ["#XAU", "#XAG", "#NAS100"]
 
-# "High impact" keyword rules (English)
-HIGH_KEYWORDS = [
-    "CPI", "Consumer Price", "Inflation",
-    "GDP", "Gross Domestic Product",
-    "Nonfarm", "Employment", "Unemployment", "Payroll",
-    "Retail Sales",
-    "Interest Rate", "Rate Decision", "Monetary Policy",
-    "FOMC", "ECB", "BoE", "BoJ", "SNB", "BoC", "RBA", "RBNZ",
-    "Press Conference", "Policy Statement", "Monetary Policy Statement",
-]
+WARSAW_TZ_NAME = "Europe/Warsaw"
 
-# Source list (best-effort). Some may block GitHub runners — we will skip if blocked.
-# We prefer official sources, but will not crash if they 403.
-SOURCES = [
-    # Central bank calendars / schedules (HTML)
-    ("USD", "FOMC (Federal Reserve) calendar", "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"),
-    ("EUR", "ECB press calendar (monetary policy)", "https://www.ecb.europa.eu/press/calendars/mgcgc/html/index.en.html"),
-    ("GBP", "BoE MPC dates (Bank of England)", "https://www.bankofengland.co.uk/monetary-policy-summary-and-minutes"),
-    ("JPY", "BoJ policy meeting schedule", "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm"),
-    ("CHF", "SNB event schedule", "https://www.snb.ch/en/services-events/digital-services/event-schedule"),
-    ("CAD", "Bank of Canada key interest rate dates", "https://www.bankofcanada.ca/core-functions/monetary-policy/key-interest-rate/"),
-    ("AUD", "RBA board meeting schedule", "https://www.rba.gov.au/schedules-events/board-meeting-schedules.html"),
-    ("NZD", "RBNZ OCR decision dates", "https://www.rbnz.govt.nz/news-and-events/how-we-release-information/ocr-decision-dates-and-financial-stability-report-dates-to-feb-2028"),
-    # US releases schedules (HTML) - may block; still try
-    ("USD", "BLS releases (schedule)", "https://www.bls.gov/schedule/news_release/current_year.asp"),
-    ("USD", "BEA schedule", "https://www.bea.gov/news/schedule"),
-    ("USD", "Census economic indicators", "https://www.census.gov/economic-indicators/"),
-]
+# Telegram limit to 4096 chars; keep margin.
+TG_LIMIT = 3900
 
-# Telegram limits: 4096 chars for text messages
-TG_LIMIT = 3900  # keep margin
+# Finnhub: best-effort retries (free tier)
+HTTP_TIMEOUT = 30
+HTTP_TRIES = 3
 
-# -------------------- Data model --------------------
+FLAG = {
+    "USD": "🇺🇸",
+    "EUR": "🇪🇺",
+    "GBP": "🇬🇧",
+    "JPY": "🇯🇵",
+    "CHF": "🇨🇭",
+    "CAD": "🇨🇦",
+    "AUD": "🇦🇺",
+    "NZD": "🇳🇿",
+}
+
 
 @dataclass
-class Event:
-    dt: Optional[datetime]  # local Warsaw time if available
+class CalEvent:
+    d: date
+    time_str: str  # as provided by API (often HH:MM)
     ccy: str
-    title: str
-    source: str
+    impact: str
+    event: str
+    country: str
+    actual: Optional[str]
+    forecast: Optional[str]
+    previous: Optional[str]
+
 
 # -------------------- Time window --------------------
 
-def warsaw_now() -> datetime:
-    return datetime.now(tz=WARSAW_TZ)
+
+def warsaw_today() -> date:
+    # Avoid extra dependencies; use system tz via environment where possible.
+    # GitHub runners are UTC; we shift by Warsaw offset approximately using pytz is not allowed.
+    # Instead, we rely on "cron" set near Warsaw midnight; and compute based on UTC date + 1h/2h.
+    # For correctness, we allow overriding via env for testing.
+    override = os.getenv("FORCE_TODAY")
+    if override:
+        return date.fromisoformat(override)
+
+    # Compute Warsaw date by using zoneinfo if available (Python 3.11 has it).
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo(WARSAW_TZ_NAME)).date()
+    except Exception:
+        # Fallback: approximate with UTC now + 1 hour (good enough for around midnight runs)
+        return (datetime.utcnow() + timedelta(hours=1)).date()
+
 
 def week_window(today: date) -> Tuple[date, date]:
-    # python weekday: Mon=0..Sun=6
+    # weekday: Mon=0..Sun=6
     wd = today.weekday()
-    if wd == 5:  # Saturday -> next week
-        start = today + timedelta(days=2)
-        end = start + timedelta(days=6)
+    if wd == 5:  # Saturday → next week
+        start = today + timedelta(days=2)  # Monday
+        end = start + timedelta(days=6)  # Sunday
     else:
         start = today
         end = today + timedelta(days=(6 - wd))
     return start, end
 
-# -------------------- HTTP helpers --------------------
 
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,pl;q=0.8",
-    "Connection": "close",
-}
+# -------------------- Finnhub API --------------------
 
-def http_get(url: str, timeout: int = 30, max_tries: int = 3, backoff: float = 1.6) -> Optional[str]:
-    last_err = None
-    for i in range(max_tries):
+
+def http_get_json(url: str, params: Dict[str, str]) -> Any:
+    last_exc: Optional[Exception] = None
+    for i in range(HTTP_TRIES):
         try:
-            r = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
-            # If blocked, return None (do not crash)
-            if r.status_code in (401,403,429):
-                return None
+            r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+            # Finnhub may rate limit (429). Backoff then retry.
+            if r.status_code == 429:
+                time.sleep(2.0 * (i + 1))
+                continue
             r.raise_for_status()
-            return r.text
+            return r.json()
         except Exception as e:
-            last_err = e
-            time.sleep(backoff ** i)
-    # final fail -> None
-    return None
+            last_exc = e
+            time.sleep(1.5 * (i + 1))
+    raise last_exc  # type: ignore
 
-# -------------------- Parsing (best-effort) --------------------
 
-def looks_high(title: str) -> bool:
-    t = title.lower()
-    for kw in HIGH_KEYWORDS:
-        if kw.lower() in t:
-            return True
-    return False
+def fetch_finnhub_calendar(start: date, end: date) -> List[CalEvent]:
+    token = os.environ.get("FINNHUB_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError(
+            "Brak FINNHUB_TOKEN. Dodaj go w GitHub: Settings → Secrets and variables → Actions."
+        )
 
-def parse_dates_from_text(text: str) -> List[date]:
-    """Try to extract a concrete calendar date from arbitrary text.
+    url = "https://finnhub.io/api/v1/calendar/economic"
+    data = http_get_json(
+        url,
+        {
+            "from": start.isoformat(),
+            "to": end.isoformat(),
+            "token": token,
+        },
+    )
 
-    We keep this intentionally conservative:
-    - If we can't parse a date, return [] (caller will skip the item).
-    - If we can parse, return [date].
-    """
-    try:
-        # Use a stable default so parser doesn't "invent" today's date from partial strings
-        default_dt = datetime(2000, 1, 1, 0, 0, tzinfo=WARSAW_TZ)
-        dt = dateparser.parse(text, fuzzy=True, dayfirst=True, default=default_dt)
-        if not dt:
-            return []
-        # If the parser returned the default date (meaning it likely failed), discard.
-        if dt.year == 2000 and dt.month == 1 and dt.day == 1:
-            return []
-        return [dt.astimezone(WARSAW_TZ).date() if dt.tzinfo else dt.date()]
-    except Exception:
+    items = data.get("economicCalendar") or data.get("economicCalendar", [])
+    if not isinstance(items, list):
         return []
 
-def extract_events_generic(ccy: str, source_name: str, url: str, start: date, end: date) -> List[Event]:
-    html = http_get(url)
-    if not html:
-        return []
-    soup = BeautifulSoup(html, "lxml")
-    # Collect candidate lines with dates
-    text = soup.get_text("\n", strip=True)
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    events: List[Event] = []
-
-    # simple heuristic:
-    # - keep only lines that look HIGH
-    # - try to parse a *concrete* date from the line
-    # - keep only events that fall within [start, end]
-    month_names = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"]
-    seen: set[tuple[str, str]] = set()
-    for ln in lines:
-        low = ln.lower()
-        if not looks_high(ln):
-            continue
-        if not (any(m in low for m in month_names) and any(ch.isdigit() for ch in low)):
-            continue
-
-        dates = parse_dates_from_text(ln)
-        if not dates:
-            continue
-
-        for d in dates:
-            if d < start or d > end:
-                continue
-            dt = datetime(d.year, d.month, d.day, 0, 0, tzinfo=WARSAW_TZ)
-            key = (ccy, ln[:180])
-            if key in seen:
-                continue
-            seen.add(key)
-            events.append(Event(dt=dt, ccy=ccy, title=ln[:180], source=source_name))
-
-    return events
-
-def collect_events(start: date, end: date) -> List[Event]:
-    out: List[Event] = []
-    for ccy, name, url in SOURCES:
-        # only major currencies
-        if ccy not in MAJOR_CCY:
-            continue
+    out: List[CalEvent] = []
+    for it in items:
         try:
-            out += extract_events_generic(ccy, name, url, start, end)
+            ccy = (it.get("currency") or "").upper().strip()
+            if ccy not in MAJOR_CCY:
+                continue
+
+            impact = (it.get("impact") or "").strip()
+            # Finnhub usually returns "High"/"Medium"/"Low"
+            if impact.lower() != "high":
+                continue
+
+            d_str = (it.get("date") or "").strip()
+            if not d_str:
+                continue
+            d = date.fromisoformat(d_str)
+
+            time_str = (it.get("time") or "").strip() or "--:--"
+            event = (it.get("event") or "").strip() or "(brak nazwy)"
+            country = (it.get("country") or "").strip()
+
+            def _val(k: str) -> Optional[str]:
+                v = it.get(k)
+                if v is None:
+                    return None
+                s = str(v).strip()
+                return s if s and s.lower() != "nan" else None
+
+            out.append(
+                CalEvent(
+                    d=d,
+                    time_str=time_str,
+                    ccy=ccy,
+                    impact=impact,
+                    event=event,
+                    country=country,
+                    actual=_val("actual"),
+                    forecast=_val("forecast"),
+                    previous=_val("previous"),
+                )
+            )
         except Exception:
-            # Never crash on source parsing
             continue
+
+    # sort by date then time string
+    out.sort(key=lambda e: (e.d, e.time_str, e.ccy, e.event))
     return out
 
-# -------------------- Telegram posting --------------------
+
+# -------------------- Telegram --------------------
+
 
 def tg_send(text: str) -> None:
-    token = os.environ["TG_BOT_TOKEN"]
-    chat_id = os.environ["TG_CHAT_ID"]
+    token = os.environ["TG_BOT_TOKEN"].strip()
+    chat_id = os.environ["TG_CHAT_ID"].strip()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -210,9 +215,18 @@ def tg_send(text: str) -> None:
     r = requests.post(url, data=payload, timeout=30)
     r.raise_for_status()
 
+
 def split_messages(text: str, limit: int = TG_LIMIT) -> List[str]:
     parts: List[str] = []
     cur = ""
+
+    def flush():
+        nonlocal cur
+        if cur:
+            parts.append(cur)
+            cur = ""
+
+    # split by blank lines blocks
     for block in text.split("\n\n"):
         block = block.strip()
         if not block:
@@ -221,62 +235,95 @@ def split_messages(text: str, limit: int = TG_LIMIT) -> List[str]:
         if len(candidate) <= limit:
             cur = candidate
         else:
-            if cur:
-                parts.append(cur)
+            flush()
+            if len(block) <= limit:
                 cur = block
             else:
-                # single block too large -> hard split
+                # hard split long block
                 for i in range(0, len(block), limit):
-                    parts.append(block[i:i+limit])
-                cur = ""
-    if cur:
-        parts.append(cur)
+                    parts.append(block[i : i + limit])
+    flush()
     return parts
 
-def format_post(start: date, end: date, events: List[Event]) -> str:
-    now = warsaw_now()
-    header = f"📅 Kalendarz makro (HIGH) — {start.isoformat()} → {end.isoformat()} (Warszawa)\n"
-    header += "Waluty: " + ", ".join(sorted(MAJOR_CCY)) + "\n"
-    header += "Dodatkowo: " + " ".join(EXTRA_TAGS) + "\n"
-    header += "Źródła: oficjalne strony instytucji (best‑effort; jeśli któraś blokuje automaty, jest pomijana)."
 
-    # If no dated data, still publish undated highlights
-    # Deduplicate titles
-    seen = set()
-    items = []
-    for ev in events:
-        key = (ev.ccy, ev.title)
-        if key in seen:
-            continue
-        seen.add(key)
-        flag = {
-            "USD":"🇺🇸","EUR":"🇪🇺","GBP":"🇬🇧","JPY":"🇯🇵","CHF":"🇨🇭","CAD":"🇨🇦","AUD":"🇦🇺","NZD":"🇳🇿"
-        }.get(ev.ccy, "🏳️")
-        items.append(f"• {flag} {ev.ccy} — {ev.title}\n  ({ev.source})")
+# -------------------- Formatowanie --------------------
 
-    if not items:
-        body = "\n\nBrak danych HIGH do pokazania (albo część źródeł zablokowała pobieranie z GitHuba)."
-    else:
-        body = "\n\n" + "\n".join(items[:120])
 
-    footer = "\n\n#forex #kalendarz #highimpact " + " ".join(EXTRA_TAGS)
-    return header + body + footer
+def format_post(start: date, end: date, events: List[CalEvent]) -> str:
+    header = (
+        f"📅 Kalendarz makro (HIGH) — {start.isoformat()} → {end.isoformat()} (Warszawa)\n"
+        f"Waluty: {', '.join(MAJOR_CCY)}\n"
+        f"Dodatkowo: {' '.join(EXTRA_TAGS)}\n"
+        "Źródło: Finnhub Economic Calendar (free tier)."
+    )
+
+    if not events:
+        return (
+            header
+            + "\n\nBrak wydarzeń HIGH w tym tygodniu dla wybranych walut.\n"
+            + "\n#forex #kalendarz #highimpact "
+            + " ".join(EXTRA_TAGS)
+        )
+
+    # group by date
+    out: List[str] = [header]
+
+    cur_day: Optional[date] = None
+    for e in events:
+        if cur_day != e.d:
+            cur_day = e.d
+            out.append(f"\n🗓 {cur_day.isoformat()}")
+
+        flag = FLAG.get(e.ccy, "🏳️")
+        line = f"• ⏰ {e.time_str}  {flag} {e.ccy} — {e.event}"
+        if e.country:
+            line += f" ({e.country})"
+
+        extras: List[str] = []
+        if e.actual is not None:
+            extras.append(f"Actual: {e.actual}")
+        if e.forecast is not None:
+            extras.append(f"Forecast: {e.forecast}")
+        if e.previous is not None:
+            extras.append(f"Previous: {e.previous}")
+        if extras:
+            line += "\n  " + " | ".join(extras)
+
+        out.append(line)
+
+    out.append("\n#forex #kalendarz #highimpact " + " ".join(EXTRA_TAGS))
+    return "\n".join(out).strip()
+
+
+# -------------------- Main --------------------
+
 
 def main() -> int:
-    today = warsaw_now().date()
+    today = warsaw_today()
     start, end = week_window(today)
 
-    events = collect_events(start, end)
+    try:
+        events = fetch_finnhub_calendar(start, end)
+    except Exception as e:
+        # If API fails, still publish a short diagnostic (so you know it's alive)
+        msg = (
+            f"📅 Kalendarz makro (HIGH) — {start.isoformat()} → {end.isoformat()} (Warszawa)\n"
+            f"Waluty: {', '.join(MAJOR_CCY)}\n"
+            f"Dodatkowo: {' '.join(EXTRA_TAGS)}\n\n"
+            "❌ Błąd pobierania danych z Finnhub.\n"
+            f"Szczegóły: {type(e).__name__}: {e}\n\n"
+            "#forex #kalendarz #highimpact "
+            + " ".join(EXTRA_TAGS)
+        )
+        for part in split_messages(msg):
+            tg_send(part)
+        return 0
+
     post = format_post(start, end, events)
-
-    parts = split_messages(post, TG_LIMIT)
-    for idx, part in enumerate(parts, 1):
-        if len(parts) > 1:
-            part = f"(część {idx}/{len(parts)})\n\n" + part
+    for part in split_messages(post):
         tg_send(part)
-        time.sleep(1.0)
-
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
