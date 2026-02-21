@@ -73,6 +73,75 @@ def week_window(now_local: datetime, saturday_next_week: bool) -> Tuple[datetime
 # Helpers
 # ----------------------------
 
+
+def parse_ics_events(ics_text: str) -> List[dict]:
+    """Very small ICS (iCalendar) parser for VEVENT DTSTART + SUMMARY + DESCRIPTION.
+    Returns a list of dicts with keys: dtstart_raw, tzid, summary, description.
+    """
+    # Unfold lines (RFC5545): lines that start with space/tab continue previous line
+    lines = ics_text.splitlines()
+    unfolded: List[str] = []
+    for line in lines:
+        if line.startswith((" ", "\t")) and unfolded:
+            unfolded[-1] += line[1:]
+        else:
+            unfolded.append(line)
+
+    events: List[dict] = []
+    cur: dict | None = None
+    for line in unfolded:
+        if line == "BEGIN:VEVENT":
+            cur = {"summary": "", "description": "", "dtstart_raw": "", "tzid": None}
+        elif line == "END:VEVENT":
+            if cur and cur.get("dtstart_raw") and cur.get("summary"):
+                events.append(cur)
+            cur = None
+        elif cur is not None:
+            if line.startswith("DTSTART"):
+                # Examples:
+                # DTSTART:20260206T133000Z
+                # DTSTART;TZID=America/New_York:20260206T083000
+                left, _, value = line.partition(":")
+                cur["dtstart_raw"] = value.strip()
+                m = re.search(r"TZID=([^;:]+)", left)
+                if m:
+                    cur["tzid"] = m.group(1)
+            elif line.startswith("SUMMARY:"):
+                cur["summary"] = line[len("SUMMARY:"):].strip()
+            elif line.startswith("DESCRIPTION:"):
+                cur["description"] = line[len("DESCRIPTION:"):].strip()
+    return events
+
+def ics_dt_to_local(dt_raw: str, tzid: str | None, tz_local) -> Optional[datetime]:
+    """Parse an ICS DTSTART value into tz_local datetime."""
+    if not dt_raw:
+        return None
+    try:
+        # Date only
+        if len(dt_raw) == 8 and dt_raw.isdigit():
+            dt = datetime.strptime(dt_raw, "%Y%m%d")
+            dt = dt.replace(tzinfo=tz_local)
+            return dt
+
+        # Datetime with Z
+        if dt_raw.endswith("Z"):
+            dt = datetime.strptime(dt_raw, "%Y%m%dT%H%M%SZ").replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
+            return dt.astimezone(tz_local)
+
+        # Datetime without Z
+        dt = datetime.strptime(dt_raw, "%Y%m%dT%H%M%S" if len(dt_raw) >= 15 else "%Y%m%dT%H%M")
+        if tzid:
+            try:
+                dt = dt.replace(tzinfo=zoneinfo.ZoneInfo(tzid))
+            except Exception:
+                dt = dt.replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
+        else:
+            dt = dt.replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
+        return dt.astimezone(tz_local)
+    except Exception:
+        return None
+
+
 def http_get(url: str, timeout: int = 30) -> str:
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; TelegramCalendarBot/1.0; +https://github.com/)"
@@ -113,42 +182,38 @@ def split_telegram(text: str, max_len: int) -> List[str]:
 # Sources (official / public)
 # ----------------------------
 
+
 def fetch_bls_selected_releases(tz_local, start: datetime, end: datetime) -> List[Event]:
     """
-    BLS schedule list view (selected releases) - contains CPI, Employment Situation etc.
+    BLS provides an official iCalendar (.ics) feed for its release calendar.
+    We use the ICS feed instead of scraping HTML (HTML may return 403 in CI environments).
     """
-    url = "https://www.bls.gov/schedule/news_release/current_year.asp"
-    html = http_get(url)
-    soup = BeautifulSoup(html, "html.parser")
+    url = "https://www.bls.gov/schedule/news_release/bls.ics"
+    ics_text = http_get(url)
+    vevents = parse_ics_events(ics_text)
 
     events: List[Event] = []
-    table = soup.find("table")
-    if not table:
-        return events
-
-    rows = table.find_all("tr")
-    for tr in rows[1:]:
-        tds = tr.find_all(["td", "th"])
-        if len(tds) < 3:
+    for ve in vevents:
+        dt_local = ics_dt_to_local(ve.get("dtstart_raw", ""), ve.get("tzid"), tz_local)
+        if not dt_local:
             continue
-        date_str = normalize_space(tds[0].get_text(" "))
-        time_str = normalize_space(tds[1].get_text(" "))
-        title = normalize_space(tds[2].get_text(" "))
-
-        # Example: "Friday, February 13, 2026" + "08:30 AM"
-        try:
-            dt = dtparse(f"{date_str} {time_str}", fuzzy=True)
-        except Exception:
-            continue
-
-        # BLS times are ET (US Eastern) usually; assume America/New_York
-        dt = dt.replace(tzinfo=tz.gettz("America/New_York"))
-        dt_local = dt.astimezone(tz_local)
-
         if dt_local < start or dt_local > end:
             continue
 
-        events.append(Event(dt_local=dt_local, currency="USD", title=title, source="BLS", url=url))
+        title = ve.get("summary", "").strip()
+        if not title:
+            continue
+
+        # Most BLS releases are USD-relevant.
+        events.append(Event(
+            source="BLS",
+            title=title,
+            currency="USD",
+            country="US",
+            impact="HIGH",  # we only pick 'high' later via keyword filters; keep as HIGH marker
+            dt=dt_local,
+            url="https://www.bls.gov/schedule/",
+        ))
     return events
 
 def fetch_bea_schedule(tz_local, start: datetime, end: datetime) -> List[Event]:
