@@ -1,0 +1,54 @@
+timezone: Europe/Warsaw
+
+telegram:
+  chat_id: "@TWOJ_KANAL"   # nadpiszesz w GitHub Secrets: TG_CHAT_ID
+  max_len: 3900           # bezpieczny limit (Telegram ma ~4096)
+
+schedule:
+  saturday_next_week: true
+
+filters:
+  impact: high
+  currencies: [USD, EUR, GBP, JPY, CHF, CAD, AUD, NZD]
+  # "Plus" instrument tags dodawane do posta (dla publiki):
+  extra_tags: ["#XAU", "#XAG", "#NAS100", "#GOLD", "#SILVER"]
+
+high_keywords:
+  USD:
+    - "Consumer Price Index"
+    - "CPI"
+    - "Employment Situation"
+    - "Nonfarm Payroll"
+    - "Unemployment"
+    - "FOMC"
+    - "Fed"
+    - "GDP"
+    - "Personal Income"
+    - "PCE"
+    - "Retail Sales"
+    - "ISM"
+  EUR:
+    - "HICP"
+    - "Inflation"
+    - "GDP"
+    - "ECB"
+    - "Euro indicators"
+  GBP:
+    - "CPI"
+    - "GDP"
+    - "Labour market"
+    - "Unemployment"
+    - "Bank of England"
+    - "BoE"
+    - "Retail sales"
+sources:
+  bls_selected_releases: true
+  bea_schedule: true
+  fed_fomc_calendar: true
+  ecb_gc_calendar: true
+  ons_release_calendar: true
+  boc_schedule: true
+  boj_schedule: true
+  snb_schedule: true
+  rba_schedule: true
+  rbnz_schedule: true
